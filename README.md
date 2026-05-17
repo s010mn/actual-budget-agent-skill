@@ -25,21 +25,28 @@ From the repository root:
 ```bash
 node actual-budget/scripts/actual-budget.mjs doctor
 node actual-budget/scripts/actual-budget.mjs env-help
-node actual-budget/scripts/actual-budget.mjs accounts
-node actual-budget/scripts/actual-budget.mjs recent --limit 5
+node actual-budget/scripts/actual-budget.mjs --fresh context --recent-limit 5
 ```
 
 Preview an expense:
 
 ```bash
-node actual-budget/scripts/actual-budget.mjs add-expense --account "Checking" --date 2026-05-17 --amount 12.34 --payee "Coffee Shop" --category "Food"
+node actual-budget/scripts/actual-budget.mjs --fresh add-expense --account "Checking" --date 2026-05-17 --amount 12.34 --payee "Coffee Shop" --category "Food"
 ```
 
 Commit only after reviewing the preview:
 
 ```bash
-node actual-budget/scripts/actual-budget.mjs add-expense --account "Checking" --date 2026-05-17 --amount 12.34 --payee "Coffee Shop" --category "Food" --yes
+node actual-budget/scripts/actual-budget.mjs --fresh add-expense --account "Checking" --date 2026-05-17 --amount 12.34 --payee "Coffee Shop" --category "Food" --yes
 ```
+
+Create a missing spending group/category on commit:
+
+```bash
+node actual-budget/scripts/actual-budget.mjs --fresh add-expense --account "Huabei" --date 2026-05-17 --amount 42 --payee "McDonald's" --category-group "可裁剪消费" --category "快餐外食" --create-category --yes
+```
+
+Use `--data-dir <path>` to reuse one fresh Actual CLI session across multiple commands. Avoid treating old `.actual-cli-data` contents as authoritative after UI edits or sync errors.
 
 ## Installation
 

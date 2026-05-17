@@ -21,6 +21,16 @@ Optional:
 - `ACTUAL_DATA_DIR`
 - `ACTUAL_ENCRYPTION_PASSWORD`
 
+The helper also accepts global session flags:
+
+```bash
+node actual-budget/scripts/actual-budget.mjs --fresh context --recent-limit 10
+node actual-budget/scripts/actual-budget.mjs --data-dir <path> accounts
+node actual-budget/scripts/actual-budget.mjs --dry-run --fresh actual -- categories list
+```
+
+Use `--fresh` when UI changes, deletes, or sync errors may make an old CLI cache stale. Use `--data-dir <path>` to reuse one fresh session for follow-up calls in the same task.
+
 ## Safe Setup Examples
 
 PowerShell:
@@ -57,10 +67,22 @@ npx -y @actual-app/cli@26.5.2 --format json server get-id --type accounts --name
 npx -y @actual-app/cli@26.5.2 --format json query run --last 10
 ```
 
+Prefer the helper's context snapshot for agent work:
+
+```bash
+node actual-budget/scripts/actual-budget.mjs --fresh context --recent-limit 10
+```
+
 Add a transaction only after previewing intent:
 
 ```bash
 npx -y @actual-app/cli@26.5.2 --format json transactions add --account <id> --data '[{"date":"2026-05-17","amount":-1234,"payee_name":"Coffee Shop"}]'
+```
+
+Preview category creation with an expense:
+
+```bash
+node actual-budget/scripts/actual-budget.mjs --fresh add-expense --account "Huabei" --date 2026-05-17 --amount 42 --payee "McDonald's" --category-group "可裁剪消费" --category "快餐外食" --create-category
 ```
 
 ## ActualQL Notes
@@ -79,3 +101,5 @@ Avoid one CLI call per month or per category. Fetch a wider date range once and 
 - JSON output keeps raw cents; table and CSV may format amounts as decimals.
 - Split parents can double-count totals unless `is_parent: false` is applied.
 - The official CLI is experimental; pin the version and verify after upgrades.
+- Do not inspect Actual SQLite/sync files as source of truth; use fresh CLI/API reads.
+- If `out-of-sync` appears, retry once with `--fresh context`; do not answer from stale `.actual-cli-data`.

@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 
 const CLI_PACKAGE = '@actual-app/cli@26.5.2';
@@ -12,12 +15,13 @@ function printHelp() {
   console.log(`Actual Budget agent helper
 
 Usage:
-  node actual-budget/scripts/actual-budget.mjs [--dry-run] <command> [options]
+  node actual-budget/scripts/actual-budget.mjs [--dry-run] [--fresh|--data-dir <path>] <command> [options]
 
 Commands:
   doctor                         Check Node, npx, and Actual env vars
   env-help                       Print environment variable setup examples
   actual -- <args>               Pass through to official Actual CLI
+  context --recent-limit <n>     Fetch accounts, categories, groups, and recent transactions
   accounts                       List accounts as JSON
   categories                     List categories as JSON
   payees                         List payees as JSON
@@ -31,6 +35,8 @@ add-expense options:
   --amount <decimal>             Required, positive expense amount
   --payee <name>                 Required
   --category <id-or-name>        Optional
+  --category-group <name>        Optional, used with --create-category
+  --create-category              Create category group/category if missing on write
   --notes <text>                 Optional
   --yes                          Actually write; default is dry-run preview
 `);
@@ -66,14 +72,38 @@ Do not commit passwords, session tokens, .env files, or shell history containing
 function parseArgs(argv) {
   const args = [...argv];
   let dryRun = false;
+  let fresh = false;
+  let dataDir;
 
-  if (args[0] === '--dry-run') {
-    dryRun = true;
-    args.shift();
+  while (args.length > 0) {
+    if (args[0] === '--dry-run') {
+      dryRun = true;
+      args.shift();
+      continue;
+    }
+
+    if (args[0] === '--fresh') {
+      fresh = true;
+      args.shift();
+      continue;
+    }
+
+    if (args[0] === '--data-dir') {
+      args.shift();
+      dataDir = args.shift();
+      if (!dataDir) throw new Error('Missing value for --data-dir');
+      continue;
+    }
+
+    break;
+  }
+
+  if (fresh && dataDir) {
+    throw new Error('Use only one of --fresh or --data-dir.');
   }
 
   const command = args.shift();
-  return { dryRun, command, args };
+  return { dryRun, fresh, dataDir, command, args };
 }
 
 function parseOptions(args) {
@@ -99,6 +129,11 @@ function parseOptions(args) {
       continue;
     }
 
+    if (key === 'create-category') {
+      options.createCategory = true;
+      continue;
+    }
+
     const value = args[i + 1];
     if (value == null || value.startsWith('--')) {
       throw new Error(`Missing value for --${key}`);
@@ -114,7 +149,20 @@ function redacted(value) {
   return value ? '<redacted>' : value;
 }
 
-function envConfig({ redactSecrets = false } = {}) {
+function taskDataDir({ fresh = false, dataDir, redactSecrets = false } = {}) {
+  if (dataDir) return dataDir;
+  if (!fresh) return undefined;
+  if (redactSecrets) return '<temp>';
+  return mkdtempSync(join(tmpdir(), 'actual-agent-'));
+}
+
+function resolveSession({ fresh = false, dataDir, dryRun = false } = {}) {
+  if (fresh && dryRun) return { fresh, dataDir: '<temp>' };
+  if (fresh) return { fresh, dataDir: taskDataDir({ fresh }) };
+  return { fresh, dataDir };
+}
+
+function envConfig({ redactSecrets = false, fresh = false, dataDir } = {}) {
   const password = process.env.ACTUAL_PASSWORD;
   const sessionToken = process.env.ACTUAL_SESSION_TOKEN;
 
@@ -123,6 +171,7 @@ function envConfig({ redactSecrets = false } = {}) {
     syncId: process.env.ACTUAL_SYNC_ID,
     password: redactSecrets ? redacted(password) : password,
     sessionToken: redactSecrets ? redacted(sessionToken) : sessionToken,
+    dataDir: taskDataDir({ fresh, dataDir, redactSecrets }),
   };
 }
 
@@ -143,21 +192,22 @@ function nodeMajor() {
   return Number.parseInt(process.versions.node.split('.')[0], 10);
 }
 
-function actualBaseArgs({ redactSecrets = false } = {}) {
-  const config = envConfig({ redactSecrets });
+function actualBaseArgs({ redactSecrets = false, fresh = false, dataDir } = {}) {
+  const config = envConfig({ redactSecrets, fresh, dataDir });
   const args = ['-y', CLI_PACKAGE];
 
   if (config.serverUrl) args.push('--server-url', config.serverUrl);
   if (config.password) args.push('--password', config.password);
   if (config.sessionToken) args.push('--session-token', config.sessionToken);
   if (config.syncId) args.push('--sync-id', config.syncId);
+  if (config.dataDir) args.push('--data-dir', config.dataDir);
   args.push('--format', 'json');
 
   return args;
 }
 
-function actualCommand(args, { redactSecrets = false } = {}) {
-  return [NPX_EXECUTABLE, ...actualBaseArgs({ redactSecrets }), ...args];
+function actualCommand(args, { redactSecrets = false, fresh = false, dataDir } = {}) {
+  return [NPX_EXECUTABLE, ...actualBaseArgs({ redactSecrets, fresh, dataDir }), ...args];
 }
 
 function commandForSpawn(command, args) {
@@ -249,8 +299,8 @@ function amountToExpenseCents(amountText) {
   return -cents;
 }
 
-function getId(type, name) {
-  const command = actualCommand(['server', 'get-id', '--type', type, '--name', name]);
+function getId(type, name, session = {}) {
+  const command = actualCommand(['server', 'get-id', '--type', type, '--name', name], session);
   const result = runCapture(command[0], command.slice(1));
   if (!result.ok) {
     throw new Error(result.stderr || result.stdout || `Failed to resolve ${type} "${name}"`);
@@ -268,7 +318,68 @@ function getId(type, name) {
   return trimmed;
 }
 
-function buildAddExpense(args, { redactSecrets = false, resolveNames = false } = {}) {
+function parseJsonOutput(result, fallbackMessage) {
+  if (!result.ok) {
+    throw new Error(result.stderr || result.stdout || fallbackMessage);
+  }
+
+  const trimmed = result.stdout.trim();
+  return trimmed ? JSON.parse(trimmed) : null;
+}
+
+function runActualJson(args, session = {}) {
+  const command = actualCommand(args, session);
+  const result = runCapture(command[0], command.slice(1));
+  return parseJsonOutput(result, `Actual CLI failed: ${args.join(' ')}`);
+}
+
+function firstArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value && Array.isArray(value.value)) return value.value;
+  return [];
+}
+
+function findCategoryGroup(groups, name) {
+  return firstArray(groups).find((group) => group.name === name);
+}
+
+function findCategory(categories, { name, groupId }) {
+  return firstArray(categories).find((category) => {
+    if (category.name !== name) return false;
+    return groupId ? category.group_id === groupId : true;
+  });
+}
+
+function ensureCategory({ categoryName, categoryGroupName, session }) {
+  if (!categoryName || looksLikeId(categoryName)) {
+    return { category: categoryName, categoryGroup: undefined, created: [] };
+  }
+
+  const created = [];
+  let group;
+  if (categoryGroupName) {
+    const groups = runActualJson(['category-groups', 'list'], session);
+    group = findCategoryGroup(groups, categoryGroupName);
+    if (!group) {
+      group = runActualJson(['category-groups', 'create', '--name', categoryGroupName], session);
+      created.push({ type: 'category-groups', name: categoryGroupName, id: group.id });
+    }
+  }
+
+  const categories = runActualJson(['categories', 'list'], session);
+  let category = findCategory(categories, { name: categoryName, groupId: group?.id });
+  if (!category) {
+    if (!group?.id) {
+      throw new Error('--create-category requires --category-group when category is missing.');
+    }
+    category = runActualJson(['categories', 'create', '--name', categoryName, '--group-id', group.id], session);
+    created.push({ type: 'categories', name: categoryName, id: category.id, groupId: group.id });
+  }
+
+  return { category: category.id, categoryGroup: group, created };
+}
+
+function buildAddExpense(args, { redactSecrets = false, resolveNames = false, fresh = false, dataDir } = {}) {
   const { options } = parseOptions(args);
   for (const key of ['account', 'date', 'amount', 'payee']) {
     if (!options[key]) throw new Error(`Missing required --${key}`);
@@ -280,20 +391,46 @@ function buildAddExpense(args, { redactSecrets = false, resolveNames = false } =
   let account = options.account;
   let category = options.category;
   const resolve = {};
+  const created = [];
+  const session = { redactSecrets, fresh, dataDir };
 
   if (looksLikeId(account)) {
     resolve.account = { type: 'accounts', id: account };
   } else {
     resolve.account = { type: 'accounts', name: account };
-    if (resolveNames) account = getId('accounts', account);
+    if (resolveNames) account = getId('accounts', account, session);
   }
 
   if (category) {
     if (looksLikeId(category)) {
       resolve.category = { type: 'categories', id: category };
     } else {
-      resolve.category = { type: 'categories', name: category };
-      if (resolveNames) category = getId('categories', category);
+      if (options['category-group']) {
+        resolve.categoryGroup = {
+          type: 'category-groups',
+          name: options['category-group'],
+          createIfMissing: Boolean(options.createCategory),
+        };
+      }
+      resolve.category = {
+        type: 'categories',
+        name: category,
+        ...(options['category-group'] ? { groupName: options['category-group'] } : {}),
+        ...(options.createCategory ? { createIfMissing: true } : {}),
+      };
+      if (resolveNames) {
+        if (options.createCategory) {
+          const ensured = ensureCategory({
+            categoryName: category,
+            categoryGroupName: options['category-group'],
+            session,
+          });
+          category = ensured.category;
+          created.push(...ensured.created);
+        } else {
+          category = getId('categories', category, session);
+        }
+      }
     }
   }
 
@@ -317,10 +454,64 @@ function buildAddExpense(args, { redactSecrets = false, resolveNames = false } =
   return {
     yes: options.yes === true,
     resolve,
+    created,
     transaction,
-    command: actualCommand(actualArgs, { redactSecrets }),
+    command: actualCommand(actualArgs, { redactSecrets, fresh, dataDir }),
     actualArgs,
   };
+}
+
+function contextCommands({ recentLimit, redactSecrets, fresh, dataDir }) {
+  return [
+    actualCommand(['accounts', 'list'], { redactSecrets, fresh, dataDir }),
+    actualCommand(['categories', 'list'], { redactSecrets, fresh, dataDir }),
+    actualCommand(['category-groups', 'list'], { redactSecrets, fresh, dataDir }),
+    actualCommand(['query', 'run', '--last', recentLimit], { redactSecrets, fresh, dataDir }),
+  ];
+}
+
+function contextDryRun(args, session) {
+  const { options } = parseOptions(args);
+  const recentLimit = options['recent-limit'] ?? '10';
+  if (!/^\d+$/.test(recentLimit) || Number.parseInt(recentLimit, 10) < 1) {
+    throw new Error('--recent-limit must be a positive integer');
+  }
+
+  return {
+    dryRun: true,
+    recentLimit,
+    dataDir: session.dataDir,
+    fresh: session.fresh,
+    commands: contextCommands({ ...session, recentLimit, redactSecrets: true }),
+  };
+}
+
+function fetchContext(args, session) {
+  const { options } = parseOptions(args);
+  const recentLimit = options['recent-limit'] ?? '10';
+  if (!/^\d+$/.test(recentLimit) || Number.parseInt(recentLimit, 10) < 1) {
+    throw new Error('--recent-limit must be a positive integer');
+  }
+
+  return {
+    dataDir: session.dataDir,
+    fresh: session.fresh,
+    accounts: runActualJson(['accounts', 'list'], session),
+    categories: runActualJson(['categories', 'list'], session),
+    categoryGroups: runActualJson(['category-groups', 'list'], session),
+    recent: runActualJson(['query', 'run', '--last', recentLimit], session),
+  };
+}
+
+function verifyTransaction({ accountName, payeeName, amount, categoryName, session }) {
+  const recent = firstArray(runActualJson(['query', 'run', '--last', '20'], session));
+  return recent.find((transaction) => {
+    if (!looksLikeId(accountName) && transaction['account.name'] !== accountName && transaction.account !== accountName) return false;
+    if (transaction['payee.name'] !== payeeName && transaction.payee_name !== payeeName) return false;
+    if (transaction.amount !== amount) return false;
+    if (categoryName && !looksLikeId(categoryName) && transaction['category.name'] !== categoryName) return false;
+    return true;
+  });
 }
 
 async function doctor() {
@@ -364,7 +555,8 @@ async function doctor() {
 }
 
 async function main() {
-  const { dryRun, command, args } = parseArgs(process.argv.slice(2));
+  const { dryRun, fresh, dataDir, command, args } = parseArgs(process.argv.slice(2));
+  const session = resolveSession({ fresh, dataDir, dryRun });
 
   try {
     if (!command || command === '--help' || command === '-h' || command === 'help') {
@@ -384,29 +576,39 @@ async function main() {
     if (command === 'actual') {
       ensureEnvForWritePreview();
       const passthrough = args[0] === '--' ? args.slice(1) : args;
-      const actual = actualCommand(passthrough, { redactSecrets: dryRun });
+      const actual = actualCommand(passthrough, { redactSecrets: dryRun, ...session });
       if (dryRun) {
-        outputJson({ dryRun: true, command: actual });
+        outputJson({ dryRun: true, ...session, command: actual });
         return 0;
       }
       return await runCommand(actual[0], actual.slice(1));
     }
 
+    if (command === 'context') {
+      ensureEnvForWritePreview();
+      if (dryRun) {
+        outputJson(contextDryRun(args, session));
+        return 0;
+      }
+      outputJson(fetchContext(args, session));
+      return 0;
+    }
+
     if (command === 'accounts') {
       ensureEnvForWritePreview();
-      const actual = actualCommand(['accounts', 'list']);
+      const actual = actualCommand(['accounts', 'list'], session);
       return await runCommand(actual[0], actual.slice(1));
     }
 
     if (command === 'categories') {
       ensureEnvForWritePreview();
-      const actual = actualCommand(['categories', 'list']);
+      const actual = actualCommand(['categories', 'list'], session);
       return await runCommand(actual[0], actual.slice(1));
     }
 
     if (command === 'payees') {
       ensureEnvForWritePreview();
-      const actual = actualCommand(['payees', 'list']);
+      const actual = actualCommand(['payees', 'list'], session);
       return await runCommand(actual[0], actual.slice(1));
     }
 
@@ -416,7 +618,7 @@ async function main() {
       if (!options.type) throw new Error('Missing required --type');
       if (!options.name) throw new Error('Missing required --name');
       ensureEntityType(options.type);
-      const actual = actualCommand(['server', 'get-id', '--type', options.type, '--name', options.name]);
+      const actual = actualCommand(['server', 'get-id', '--type', options.type, '--name', options.name], session);
       return await runCommand(actual[0], actual.slice(1));
     }
 
@@ -427,20 +629,43 @@ async function main() {
       if (!/^\d+$/.test(limit) || Number.parseInt(limit, 10) < 1) {
         throw new Error('--limit must be a positive integer');
       }
-      const actual = actualCommand(['query', 'run', '--last', limit]);
+      const actual = actualCommand(['query', 'run', '--last', limit], session);
       return await runCommand(actual[0], actual.slice(1));
     }
 
     if (command === 'add-expense') {
       ensureEnvForWritePreview();
-      const preview = buildAddExpense(args, { redactSecrets: true, resolveNames: false });
+      const preview = buildAddExpense(args, { redactSecrets: true, resolveNames: false, ...session });
       if (!preview.yes || dryRun) {
         outputJson({ dryRun: true, ...preview, yes: undefined, actualArgs: undefined });
         return 0;
       }
 
-      const write = buildAddExpense(args, { redactSecrets: false, resolveNames: true });
-      return await runCommand(NPX_EXECUTABLE, actualBaseArgs().concat(write.actualArgs));
+      const write = buildAddExpense(args, { redactSecrets: false, resolveNames: true, ...session });
+      const result = runCapture(NPX_EXECUTABLE, actualBaseArgs(session).concat(write.actualArgs));
+      if (!result.ok) {
+        console.error(result.stderr || result.stdout || 'Failed to add transaction');
+        return result.status;
+      }
+
+      const { options } = parseOptions(args);
+      const verified = verifyTransaction({
+        accountName: options.account,
+        payeeName: options.payee,
+        amount: write.transaction.amount,
+        categoryName: options.category,
+        session,
+      });
+
+      outputJson({
+        ok: true,
+        created: write.created,
+        resolve: write.resolve,
+        transaction: write.transaction,
+        write: result.stdout.trim() || 'ok',
+        verifiedTransactionId: verified?.id ?? null,
+      });
+      return 0;
     }
 
     throw new Error(`Unknown command "${command}". Run with --help for usage.`);
